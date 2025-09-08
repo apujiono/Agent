@@ -1,2 +1,4 @@
 requests==2.31.0
+PySocks==1.7.1
+pycryptodome==3.20.0
 paho-mqtt==1.6.1
