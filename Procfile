@@ -1,1 +1,1 @@
-worker: python agent.py
+worker: python3 agent.py
